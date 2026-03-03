@@ -1,5 +1,5 @@
 // frontend/src/components/admin/AdminUsers.jsx
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import api from '../../services/api';
 import { toast } from 'react-hot-toast';
 import { 
@@ -11,7 +11,6 @@ import {
   Unlock, 
   Copy, 
   Plus,
-  DollarSign,
   X,
   Wallet
 } from 'lucide-react';
@@ -37,8 +36,8 @@ export default function AdminUsers() {
   const [expandedUserId, setExpandedUserId] = useState(null);
   const [searchQuery, setSearchQuery] = useState('');
 
-  // ✅ Add Money Modal State
-  const [addMoneyModal, setAddMoneyModal] = useState(null); // { user, account }
+  // Add Money Modal State
+  const [addMoneyModal, setAddMoneyModal] = useState(null);
   const [addMoneyAmount, setAddMoneyAmount] = useState('');
   const [addMoneyNote, setAddMoneyNote] = useState('');
   const [addMoneyLoading, setAddMoneyLoading] = useState(false);
@@ -51,20 +50,22 @@ export default function AdminUsers() {
     role: 'user',
     password: '',
     leverage: 5,
-    maxSavedAccounts: -1,
+    maxSavedAccounts: 3,
     brokerageRate: 0.0003,
     demoBalance: 100000,
-    createDemo: true,   // ✅ Create Demo Account
-    createLive: true,   // ✅ Create Live Account
+    createDemo: true,
+    createLive: true,
   });
 
-  const loadUsers = async () => {
+  const loadUsers = useCallback(async () => {
     setLoading(true);
     try {
       const res = await api.get(`/admin/users?limit=500&q=${searchQuery}`);
       
-      if (res.data?.success && res.data?.data) {
-        setUsers(res.data.data);
+      // ✅ Handle both response formats for compatibility
+      if (res.data?.success) {
+        const userData = res.data.data || res.data.users || [];
+        setUsers(userData);
       } else {
         setUsers([]);
       }
@@ -75,14 +76,15 @@ export default function AdminUsers() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [searchQuery]);
 
   useEffect(() => {
     loadUsers();
-  }, []);
+  }, [loadUsers]);
 
-  // ✅ Copy Login ID to clipboard
+  // Copy Login ID to clipboard
   const copyLoginId = (loginId) => {
+    if (!loginId) return;
     navigator.clipboard.writeText(loginId);
     toast.success(`Copied: ${loginId}`);
   };
@@ -92,49 +94,63 @@ export default function AdminUsers() {
       return toast.error('Email, First name, Last name required');
     }
 
-    // ✅ Validate at least one account type is selected
     if (!form.createDemo && !form.createLive) {
       return toast.error('Select at least one account type (Demo or Live)');
     }
 
     try {
       const res = await api.post('/admin/users', {
-        ...form,
+        email: form.email,
+        firstName: form.firstName,
+        lastName: form.lastName,
+        phone: form.phone,
+        role: form.role,
+        password: form.password || undefined, // Let backend generate if empty
+        leverage: Number(form.leverage),
         brokerageRate: Number(form.brokerageRate),
-        maxSavedAccounts: form.maxSavedAccounts,
+        maxSavedAccounts: Number(form.maxSavedAccounts),
+        demoBalance: Number(form.demoBalance),
+        createDemo: form.createDemo,
+        createLive: form.createLive,
       });
       
-      const data = res.data?.data;
-      const tempPassword = data?.tempPassword;
-      const loginId = data?.loginId;
-      
-      toast.success('User created');
+      if (res.data?.success) {
+        const data = res.data.data;
+        const tempPassword = data?.tempPassword;
+        const loginId = data?.loginId;
+        
+        toast.success('User created successfully!');
 
-      if (loginId) {
-        const credentials = `Login ID: ${loginId}\nPassword: ${tempPassword}`;
-        window.prompt('User credentials (copy now):', credentials);
-      } else if (tempPassword) {
-        window.prompt('Temporary password (copy now):', tempPassword);
+        // Show credentials if available
+        if (loginId && tempPassword) {
+          const credentials = `Login ID: ${loginId}\nPassword: ${tempPassword}`;
+          window.prompt('User credentials (copy now):', credentials);
+        } else if (loginId) {
+          window.prompt('Login ID:', loginId);
+        }
+
+        // Reset form
+        setForm({
+          email: '',
+          firstName: '',
+          lastName: '',
+          phone: '',
+          role: 'user',
+          password: '',
+          leverage: 5,
+          maxSavedAccounts: 3,
+          brokerageRate: 0.0003,
+          demoBalance: 100000,
+          createDemo: true,
+          createLive: true,
+        });
+
+        loadUsers();
+      } else {
+        toast.error(res.data?.message || 'Create user failed');
       }
-
-      setForm({
-        email: '',
-        firstName: '',
-        lastName: '',
-        phone: '',
-        role: 'user',
-        password: '',
-        leverage: 5,
-        maxSavedAccounts: -1,
-        brokerageRate: 0.0003,
-        demoBalance: 100000,
-        createDemo: true,
-        createLive: true,
-      });
-
-      loadUsers();
     } catch (e) {
-      console.error(e);
+      console.error('Create user error:', e);
       toast.error(e.response?.data?.message || 'Create user failed');
     }
   };
@@ -201,7 +217,7 @@ export default function AdminUsers() {
     }
   };
 
-  // ✅ NEW: Add Money to Account
+  // Add Money to Account
   const handleAddMoney = async () => {
     if (!addMoneyModal || !addMoneyAmount || Number(addMoneyAmount) <= 0) {
       return toast.error('Enter a valid amount');
@@ -213,7 +229,6 @@ export default function AdminUsers() {
         accountId: addMoneyModal.account.id,
         amount: Number(addMoneyAmount),
         note: addMoneyNote || 'Admin deposit - Cash received offline',
-        type: 'admin_deposit'
       });
 
       if (res.data?.success) {
@@ -233,7 +248,7 @@ export default function AdminUsers() {
     }
   };
 
-  // ✅ Add Money Modal Component
+  // Add Money Modal Component
   const AddMoneyModal = () => {
     if (!addMoneyModal) return null;
 
@@ -264,7 +279,7 @@ export default function AdminUsers() {
             <div className="p-3 rounded-lg" style={{ background: '#2a2e39' }}>
               <div className="text-sm" style={{ color: '#787b86' }}>User</div>
               <div className="font-bold" style={{ color: '#d1d4dc' }}>
-                {user.login_id} - {user.first_name} {user.last_name}
+                {user.login_id || 'N/A'} - {user.first_name} {user.last_name}
               </div>
               <div className="text-xs mt-1" style={{ color: '#787b86' }}>{user.email}</div>
               
@@ -411,7 +426,7 @@ export default function AdminUsers() {
               className="p-2 rounded-lg flex items-center gap-2 text-sm"
               style={{ background: '#2a2e39', color: '#d1d4dc' }}
             >
-              <RefreshCw size={16} />
+              <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />
             </button>
           </div>
         </div>
@@ -468,13 +483,12 @@ export default function AdminUsers() {
               />
             </div>
 
-            {/* ✅ NEW: Account Type Checkboxes */}
+            {/* Account Type Checkboxes */}
             <div className="p-3 rounded-lg" style={{ background: '#1e222d', border: '1px solid #363a45' }}>
               <label className="text-xs mb-2 block font-medium" style={{ color: '#787b86' }}>
                 Create Account Types
               </label>
               <div className="flex items-center gap-4">
-                {/* Demo Account Checkbox */}
                 <label className="flex items-center gap-2 cursor-pointer">
                   <input
                     type="checkbox"
@@ -488,7 +502,6 @@ export default function AdminUsers() {
                   </span>
                 </label>
 
-                {/* Live Account Checkbox */}
                 <label className="flex items-center gap-2 cursor-pointer">
                   <input
                     type="checkbox"
@@ -503,7 +516,6 @@ export default function AdminUsers() {
                 </label>
               </div>
 
-              {/* Warning if none selected */}
               {!form.createDemo && !form.createLive && (
                 <div className="mt-2 text-xs" style={{ color: '#ef5350' }}>
                   ⚠️ Please select at least one account type
@@ -756,22 +768,20 @@ export default function AdminUsers() {
                                 </div>
                                 
                                 <div className="flex items-center gap-2">
-                                  {/* ✅ Add Money Button (Only for LIVE accounts) */}
-                                  {!acc.is_demo && (
-                                    <button
-                                      onClick={() => setAddMoneyModal({ user: u, account: acc })}
-                                      className="px-2 py-1 rounded text-[10px] font-medium flex items-center gap-1"
-                                      style={{ 
-                                        background: '#26a69a20', 
-                                        border: '1px solid #26a69a50', 
-                                        color: '#26a69a' 
-                                      }}
-                                      title="Add money to this account"
-                                    >
-                                      <Plus size={12} />
-                                      Add Money
-                                    </button>
-                                  )}
+                                  {/* Add Money Button (for both demo and live) */}
+                                  <button
+                                    onClick={() => setAddMoneyModal({ user: u, account: acc })}
+                                    className="px-2 py-1 rounded text-[10px] font-medium flex items-center gap-1"
+                                    style={{ 
+                                      background: '#26a69a20', 
+                                      border: '1px solid #26a69a50', 
+                                      color: '#26a69a' 
+                                    }}
+                                    title="Add money to this account"
+                                  >
+                                    <Plus size={12} />
+                                    Add Money
+                                  </button>
 
                                   <span className="text-xs" style={{ color: '#787b86' }}>Leverage:</span>
                                   <select
@@ -803,7 +813,7 @@ export default function AdminUsers() {
         </div>
       </div>
 
-      {/* ✅ Add Money Modal */}
+      {/* Add Money Modal */}
       <AddMoneyModal />
     </div>
   );

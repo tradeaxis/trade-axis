@@ -18,20 +18,25 @@ class KiteService {
 
   async init() {
     if (this.initialized) return;
+    
     if (!this.isConfigured()) {
       console.log('ℹ️ Kite not configured. Using simulated prices.');
       this.initialized = true;
       return;
     }
 
-    this.kc = new KiteConnect({ api_key: this.apiKey });
-    this.accessToken = await this.getAccessTokenFromDB();
+    try {
+      this.kc = new KiteConnect({ api_key: this.apiKey });
+      this.accessToken = await this.getAccessTokenFromDB();
 
-    if (this.accessToken) {
-      this.kc.setAccessToken(this.accessToken);
-      console.log('✅ Kite access token loaded from DB.');
-    } else {
-      console.log('ℹ️ Kite access token not set yet.');
+      if (this.accessToken) {
+        this.kc.setAccessToken(this.accessToken);
+        console.log('✅ Kite access token loaded from DB.');
+      } else {
+        console.log('ℹ️ Kite access token not set yet.');
+      }
+    } catch (error) {
+      console.error('❌ Kite init error:', error.message);
     }
 
     this.initialized = true;
@@ -54,10 +59,30 @@ class KiteService {
   }
 
   async saveAccessTokenToDB(token) {
-    const now = new Date().toISOString();
-    await supabase
-      .from('app_settings')
-      .upsert({ key: 'kite_access_token', value: token, updated_at: now });
+    try {
+      const now = new Date().toISOString();
+      
+      const { data: existing } = await supabase
+        .from('app_settings')
+        .select('id')
+        .eq('key', 'kite_access_token')
+        .single();
+
+      if (existing) {
+        await supabase
+          .from('app_settings')
+          .update({ value: token, updated_at: now })
+          .eq('key', 'kite_access_token');
+      } else {
+        await supabase
+          .from('app_settings')
+          .insert({ key: 'kite_access_token', value: token, updated_at: now });
+      }
+      
+      console.log('✅ Kite access token saved to DB');
+    } catch (err) {
+      console.error('❌ Failed to save Kite token:', err.message);
+    }
   }
 
   isSessionReady() {
@@ -65,67 +90,83 @@ class KiteService {
   }
 
   getLoginURL() {
-    if (!this.kc) return null;
+    if (!this.kc) {
+      if (this.isConfigured()) {
+        this.kc = new KiteConnect({ api_key: this.apiKey });
+      } else {
+        return null;
+      }
+    }
     return this.kc.getLoginURL();
   }
 
   async generateSession(requestToken) {
-    await this.init();
-    if (!this.kc) throw new Error('Kite not initialized');
-    if (!requestToken) throw new Error('requestToken is required');
+    if (!this.apiKey || !this.apiSecret) {
+      throw new Error('Kite API credentials not configured in .env');
+    }
 
-    const session = await this.kc.generateSession(requestToken, this.apiSecret);
-    this.accessToken = session.access_token;
-    this.kc.setAccessToken(this.accessToken);
+    if (!requestToken) {
+      throw new Error('Request token is required');
+    }
 
-    await this.saveAccessTokenToDB(this.accessToken);
+    const cleanToken = requestToken.trim().replace(/['"]/g, '');
 
-    return {
-      accessToken: this.accessToken,
-      userId: session.user_id,
-      createdAt: session.created_at,
-    };
+    if (!cleanToken) {
+      throw new Error('Invalid request token');
+    }
+
+    this.kc = new KiteConnect({ api_key: this.apiKey });
+
+    console.log('🔄 Generating Kite session...');
+    console.log('   API Key:', this.apiKey);
+    console.log('   API Secret length:', this.apiSecret?.length);
+    console.log('   Token (first 10 chars):', cleanToken.substring(0, 10) + '...');
+
+    try {
+      const session = await this.kc.generateSession(cleanToken, this.apiSecret);
+      
+      if (!session || !session.access_token) {
+        throw new Error('Invalid session response from Kite');
+      }
+
+      this.accessToken = session.access_token;
+      this.kc.setAccessToken(this.accessToken);
+      this.initialized = true;
+
+      await this.saveAccessTokenToDB(this.accessToken);
+
+      console.log('✅ Kite session created successfully');
+      console.log('   User ID:', session.user_id);
+
+      return {
+        accessToken: this.accessToken,
+        userId: session.user_id,
+        userName: session.user_name,
+        email: session.email,
+        createdAt: new Date().toISOString(),
+      };
+    } catch (error) {
+      console.error('❌ Kite generateSession error:', error.message);
+      
+      if (error.message.includes('Invalid `request_token`')) {
+        throw new Error('Invalid or expired request token. Tokens expire in ~2 minutes. Please login again.');
+      }
+      if (error.message.includes('checksum')) {
+        throw new Error('Invalid API secret. Please verify KITE_API_SECRET in .env matches your Kite app settings.');
+      }
+      if (error.message.includes('used')) {
+        throw new Error('This request token has already been used. Please login again.');
+      }
+
+      throw new Error(`Kite session failed: ${error.message}`);
+    }
   }
 
-  // ============ IMPROVED SYMBOL SYNC ============
-
-  /**
-   * Month names for display
-   */
   getMonthName(date) {
-    const months = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN',
-                     'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
+    const months = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
     return months[new Date(date).getMonth()];
   }
 
-  getFullMonthName(date) {
-    const months = ['January', 'February', 'March', 'April', 'May', 'June',
-                     'July', 'August', 'September', 'October', 'November', 'December'];
-    return months[new Date(date).getMonth()];
-  }
-
-  /**
-   * Create a readable display name from instrument
-   * e.g., "RELIANCE 27MAR25 FUT" → "RELIANCE MAR 2025 FUT"
-   */
-  createDisplayName(instrument) {
-    const name = String(instrument.name || '').toUpperCase();
-    const expiry = instrument.expiry;
-
-    if (!expiry) return `${name} FUT`;
-
-    const expiryDate = new Date(expiry);
-    const month = this.getMonthName(expiry);
-    const year = expiryDate.getFullYear();
-    const day = expiryDate.getDate();
-
-    return `${name} ${day}${month}${year} FUT`;
-  }
-
-  /**
-   * Create a short display name
-   * e.g., "RELIANCE MAR FUT"
-   */
   createShortDisplayName(instrument) {
     const name = String(instrument.name || '').toUpperCase();
     const expiry = instrument.expiry;
@@ -138,18 +179,21 @@ class KiteService {
     return `${name} ${month}${year} FUT`;
   }
 
-  /**
-   * Returns FUT instruments from NFO / MCX / BFO only.
-   */
   async fetchFuturesInstruments() {
     await this.init();
-    if (!this.isSessionReady()) throw new Error('Kite session not ready');
+    if (!this.isSessionReady()) {
+      throw new Error('Kite session not ready. Please login first.');
+    }
+
+    console.log('📊 Fetching instruments from Kite...');
 
     const [nfo, mcx, bfo] = await Promise.all([
       this.kc.getInstruments('NFO').catch(() => []),
       this.kc.getInstruments('MCX').catch(() => []),
       this.kc.getInstruments('BFO').catch(() => []),
     ]);
+
+    console.log(`   NFO: ${nfo.length}, MCX: ${mcx.length}, BFO: ${bfo.length}`);
 
     const all = [...nfo, ...mcx, ...bfo];
 
@@ -158,23 +202,21 @@ class KiteService {
   }
 
   /**
-   * Sync ALL FUT instruments to Supabase symbols table.
-   * Creates:
-   *  1. Each actual contract: RELIANCE25MARFUT, NIFTY25MARFUT etc.
-   *  2. Rolling aliases: RELIANCE-I (front), RELIANCE-II (next), RELIANCE-III (far)
+   * Sync ALL FUT instruments to Supabase.
+   * ✅ IMPORTANT: lot_size = 1 (1 lot = 1 share for this platform)
    */
   async syncSymbolsToDB() {
     const instruments = await this.fetchFuturesInstruments();
 
     console.log(`📊 Fetched ${instruments.length} FUT instruments from Kite`);
 
-    // Categorize by exchange/underlying
+    if (instruments.length === 0) {
+      throw new Error('No futures instruments found. Session may have expired.');
+    }
+
     const indexSet = new Set(['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY']);
     const sensexSet = new Set(['SENSEX', 'BANKEX']);
-
-    // Group by underlying for alias creation
     const byUnderlying = new Map();
-
     const rows = [];
 
     // 1) Create a row for EACH actual contract
@@ -191,7 +233,6 @@ class KiteService {
       else if (sensexSet.has(underlying)) category = 'sensex_futures';
       else if (indexSet.has(underlying)) category = 'index_futures';
 
-      // Create readable display name
       const displayName = this.createShortDisplayName(inst);
       const expiryDate = inst.expiry
         ? new Date(inst.expiry).toISOString().slice(0, 10)
@@ -204,7 +245,7 @@ class KiteService {
         category,
         segment: exchange,
         instrument_type: 'FUT',
-        lot_size: Number(inst.lot_size || 1),
+        lot_size: 1, // ✅ 1 LOT = 1 SHARE
         tick_size: Number(inst.tick_size || 0.05),
         kite_exchange: exchange,
         kite_tradingsymbol: tradingsymbol,
@@ -213,9 +254,11 @@ class KiteService {
         underlying,
         series: null,
         is_active: true,
+        last_update: new Date().toISOString(),
+        // Store original lot size for reference
+        original_lot_size: Number(inst.lot_size || 1),
       });
 
-      // Group for alias
       if (!byUnderlying.has(underlying)) byUnderlying.set(underlying, []);
       byUnderlying.get(underlying).push(inst);
     }
@@ -225,17 +268,9 @@ class KiteService {
     const seriesLabels = ['Near Month', 'Next Month', 'Far Month'];
 
     for (const [underlying, list] of byUnderlying.entries()) {
-      // Sort by expiry (nearest first)
-      const sorted = [...list].sort(
-        (a, b) => new Date(a.expiry) - new Date(b.expiry)
-      );
-
-      // Filter out expired contracts
+      const sorted = [...list].sort((a, b) => new Date(a.expiry) - new Date(b.expiry));
       const now = new Date();
-      const active = sorted.filter(
-        (i) => new Date(i.expiry) >= now
-      );
-
+      const active = sorted.filter((i) => new Date(i.expiry) >= now);
       const picks = active.slice(0, 3);
 
       for (let idx = 0; idx < picks.length; idx++) {
@@ -259,24 +294,24 @@ class KiteService {
           category,
           segment: exchange,
           instrument_type: 'FUT',
-          lot_size: Number(inst.lot_size || 1),
+          lot_size: 1, // ✅ 1 LOT = 1 SHARE
           tick_size: Number(inst.tick_size || 0.05),
           kite_exchange: exchange,
           kite_tradingsymbol: String(inst.tradingsymbol).toUpperCase(),
           kite_instrument_token: inst.instrument_token,
-          expiry_date: inst.expiry
-            ? new Date(inst.expiry).toISOString().slice(0, 10)
-            : null,
+          expiry_date: inst.expiry ? new Date(inst.expiry).toISOString().slice(0, 10) : null,
           underlying,
           series,
           is_active: true,
+          last_update: new Date().toISOString(),
+          original_lot_size: Number(inst.lot_size || 1),
         });
       }
     }
 
     console.log(`📝 Upserting ${rows.length} symbols (${byUnderlying.size} underlyings)...`);
 
-    // First, mark all existing symbols as inactive
+    // Mark existing FUT symbols as inactive
     await supabase
       .from('symbols')
       .update({ is_active: false })
@@ -299,19 +334,7 @@ class KiteService {
       upsertedCount += chunk.length;
     }
 
-    // Clean up old inactive symbols (optional - keeps DB clean)
-    const { error: cleanupError } = await supabase
-      .from('symbols')
-      .delete()
-      .eq('is_active', false)
-      .eq('instrument_type', 'FUT')
-      .lt('last_update', new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString());
-
-    if (cleanupError) {
-      console.warn('⚠️ Cleanup warning:', cleanupError.message);
-    }
-
-    console.log(`✅ Synced ${upsertedCount} symbols from ${byUnderlying.size} underlyings`);
+    console.log(`✅ Synced ${upsertedCount} symbols (lot_size=1) from ${byUnderlying.size} underlyings`);
 
     return {
       count: upsertedCount,
@@ -321,7 +344,6 @@ class KiteService {
     };
   }
 
-  // ============ HISTORICAL CANDLES ============
   async getHistoricalCandles(appSymbol, timeframe = '15m', count = 300) {
     await this.init();
     if (!this.isSessionReady()) return null;
@@ -347,7 +369,6 @@ class KiteService {
     };
 
     const interval = intervalMap[timeframe] || '15minute';
-
     const now = DateTime.now().setZone('Asia/Kolkata');
     let from;
 
@@ -367,10 +388,6 @@ class KiteService {
       case '1d':
         from = now.minus({ days: 365 });
         break;
-      case '1w':
-      case '1M':
-        from = now.minus({ years: 3 });
-        break;
       default:
         from = now.minus({ days: 30 });
     }
@@ -384,7 +401,7 @@ class KiteService {
         false
       );
 
-      const candles = (raw || []).slice(-count).map((c) => ({
+      return (raw || []).slice(-count).map((c) => ({
         time: Math.floor(new Date(c.date).getTime() / 1000),
         open: Number(c.open),
         high: Number(c.high),
@@ -392,8 +409,6 @@ class KiteService {
         close: Number(c.close),
         volume: Number(c.volume || 0),
       }));
-
-      return candles;
     } catch (err) {
       console.error('getHistoricalCandles error:', err.message);
       return null;

@@ -1,10 +1,38 @@
 // backend/src/controllers/adminController.js
 const { supabase } = require('../config/supabase');
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 const kiteService = require('../services/kiteService');
 const kiteStreamService = require('../services/kiteStreamService');
 
-// ============ EXISTING USER FUNCTIONS ============
+// ============ HELPER: Generate Login ID ============
+const generateLoginId = async () => {
+  // Get the highest existing login_id number
+  const { data: lastUser } = await supabase
+    .from('users')
+    .select('login_id')
+    .like('login_id', 'TA%')
+    .order('created_at', { ascending: false })
+    .limit(1);
+
+  let nextNumber = 1000;
+  
+  if (lastUser && lastUser.length > 0 && lastUser[0].login_id) {
+    const match = lastUser[0].login_id.match(/TA(\d+)/);
+    if (match) {
+      nextNumber = parseInt(match[1], 10) + 1;
+    }
+  }
+
+  return `TA${nextNumber}`;
+};
+
+// ============ HELPER: Generate Random Password ============
+const generateTempPassword = () => {
+  return crypto.randomBytes(4).toString('hex').toUpperCase(); // 8 char hex
+};
+
+// ============ USER FUNCTIONS ============
 
 exports.listUsers = async (req, res) => {
   try {
@@ -19,7 +47,7 @@ exports.listUsers = async (req, res) => {
     // Add search if provided
     if (q && q.trim()) {
       const searchTerm = q.trim().toLowerCase();
-      query = query.or(`email.ilike.%${searchTerm}%,first_name.ilike.%${searchTerm}%,last_name.ilike.%${searchTerm}%`);
+      query = query.or(`email.ilike.%${searchTerm}%,first_name.ilike.%${searchTerm}%,last_name.ilike.%${searchTerm}%,login_id.ilike.%${searchTerm}%`);
     }
 
     const { data: users, error } = await query;
@@ -39,23 +67,25 @@ exports.listUsers = async (req, res) => {
 
         return {
           id: user.id,
+          login_id: user.login_id,
           email: user.email,
-          firstName: user.first_name,
-          lastName: user.last_name,
+          first_name: user.first_name,
+          last_name: user.last_name,
           phone: user.phone,
           role: user.role || 'user',
-          isActive: user.is_active !== false,
+          is_active: user.is_active !== false,
           leverage: user.leverage || 5,
-          brokerageRate: user.brokerage_rate || 0.0003,
-          maxSavedAccounts: user.max_saved_accounts || 3,
-          closingMode: user.closing_mode || false,
-          createdAt: user.created_at,
+          brokerage_rate: user.brokerage_rate || 0.0003,
+          max_saved_accounts: user.max_saved_accounts || 3,
+          closing_mode: user.closing_mode || false,
+          created_at: user.created_at,
           accounts: accounts || [],
         };
       })
     );
 
-    res.json({ success: true, users: usersWithAccounts });
+    // ✅ Return as 'data' to match frontend expectation
+    res.json({ success: true, data: usersWithAccounts });
   } catch (error) {
     console.error('listUsers error:', error);
     res.status(500).json({ success: false, message: error.message });
@@ -64,17 +94,55 @@ exports.listUsers = async (req, res) => {
 
 exports.createUser = async (req, res) => {
   try {
-    const { email, password, firstName, lastName, phone, role = 'user' } = req.body;
+    const { 
+      email, 
+      password, 
+      firstName, 
+      lastName, 
+      phone, 
+      role = 'user',
+      leverage = 5,
+      brokerageRate = 0.0003,
+      maxSavedAccounts = 3,
+      demoBalance = 100000,
+      createDemo = true,
+      createLive = true,
+    } = req.body;
 
-    if (!email || !password) {
-      return res.status(400).json({ success: false, message: 'Email and password required' });
+    if (!email) {
+      return res.status(400).json({ success: false, message: 'Email is required' });
     }
 
-    const hashedPassword = await bcrypt.hash(password, 12);
+    if (!firstName || !lastName) {
+      return res.status(400).json({ success: false, message: 'First name and last name are required' });
+    }
 
+    // Check if at least one account type is selected
+    if (!createDemo && !createLive) {
+      return res.status(400).json({ success: false, message: 'Select at least one account type' });
+    }
+
+    // Check if email already exists
+    const { data: existingUser } = await supabase
+      .from('users')
+      .select('id')
+      .eq('email', email.toLowerCase().trim())
+      .single();
+
+    if (existingUser) {
+      return res.status(400).json({ success: false, message: 'Email already registered' });
+    }
+
+    // Generate login_id and password
+    const loginId = await generateLoginId();
+    const tempPassword = password || generateTempPassword();
+    const hashedPassword = await bcrypt.hash(tempPassword, 12);
+
+    // Create user
     const { data: user, error } = await supabase
       .from('users')
       .insert({
+        login_id: loginId,
         email: email.toLowerCase().trim(),
         password: hashedPassword,
         first_name: firstName || '',
@@ -82,38 +150,70 @@ exports.createUser = async (req, res) => {
         phone: phone || '',
         role,
         is_active: true,
-        leverage: 5,
-        brokerage_rate: 0.0003,
-        max_saved_accounts: 3,
+        leverage: Number(leverage) || 5,
+        brokerage_rate: Number(brokerageRate) || 0.0003,
+        max_saved_accounts: Number(maxSavedAccounts) || 3,
+        closing_mode: false,
       })
       .select()
       .single();
 
-    if (error) throw error;
+    if (error) {
+      console.error('Create user DB error:', error);
+      throw error;
+    }
 
-    // Create demo and live accounts
+    // Create accounts based on selection
+    const accountsToCreate = [];
     const accountNumber = `TA${Date.now().toString().slice(-8)}`;
 
-    await supabase.from('accounts').insert([
-      {
+    if (createDemo) {
+      accountsToCreate.push({
         user_id: user.id,
         account_number: `${accountNumber}D`,
         is_demo: true,
-        balance: 100000,
-        equity: 100000,
-        leverage: 5,
-      },
-      {
+        balance: Number(demoBalance) || 100000,
+        equity: Number(demoBalance) || 100000,
+        margin: 0,
+        free_margin: Number(demoBalance) || 100000,
+        leverage: Number(leverage) || 5,
+      });
+    }
+
+    if (createLive) {
+      accountsToCreate.push({
         user_id: user.id,
         account_number: `${accountNumber}L`,
         is_demo: false,
         balance: 0,
         equity: 0,
-        leverage: 5,
-      },
-    ]);
+        margin: 0,
+        free_margin: 0,
+        leverage: Number(leverage) || 5,
+      });
+    }
 
-    res.json({ success: true, user, message: 'User created successfully' });
+    if (accountsToCreate.length > 0) {
+      const { error: accountError } = await supabase
+        .from('accounts')
+        .insert(accountsToCreate);
+
+      if (accountError) {
+        console.error('Create accounts error:', accountError);
+        // Don't fail the whole operation, user is created
+      }
+    }
+
+    // ✅ Return data in format frontend expects
+    res.json({ 
+      success: true, 
+      data: {
+        user,
+        loginId,
+        tempPassword: password ? null : tempPassword, // Only return if auto-generated
+      },
+      message: 'User created successfully' 
+    });
   } catch (error) {
     console.error('createUser error:', error);
     res.status(500).json({ success: false, message: error.message });
@@ -143,11 +243,14 @@ exports.resetPassword = async (req, res) => {
     const { id } = req.params;
     const { newPassword } = req.body;
 
-    if (!newPassword || newPassword.length < 6) {
-      return res.status(400).json({ success: false, message: 'Password must be at least 6 characters' });
+    // Generate new password if not provided
+    const tempPassword = newPassword || generateTempPassword();
+
+    if (tempPassword.length < 4) {
+      return res.status(400).json({ success: false, message: 'Password must be at least 4 characters' });
     }
 
-    const hashedPassword = await bcrypt.hash(newPassword, 12);
+    const hashedPassword = await bcrypt.hash(tempPassword, 12);
 
     const { error } = await supabase
       .from('users')
@@ -156,7 +259,12 @@ exports.resetPassword = async (req, res) => {
 
     if (error) throw error;
 
-    res.json({ success: true, message: 'Password reset successfully' });
+    // ✅ Return tempPassword so admin can share it
+    res.json({ 
+      success: true, 
+      data: { tempPassword },
+      message: 'Password reset successfully' 
+    });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -165,30 +273,40 @@ exports.resetPassword = async (req, res) => {
 exports.getLeverageOptions = async (req, res) => {
   res.json({
     success: true,
-    options: [1, 2, 3, 5, 10, 15, 20, 25, 50],
+    options: [1, 2, 3, 5, 10, 15, 20, 25, 50, 100, 200],
   });
 };
 
 exports.updateUserLeverage = async (req, res) => {
   try {
     const { id } = req.params;
-    const { leverage } = req.body;
+    const { leverage, accountId } = req.body;
 
-    // Update user
-    const { error: userError } = await supabase
-      .from('users')
-      .update({ leverage })
-      .eq('id', id);
+    // If specific accountId provided, only update that account
+    if (accountId) {
+      const { error: accountError } = await supabase
+        .from('accounts')
+        .update({ leverage: Number(leverage) })
+        .eq('id', accountId);
 
-    if (userError) throw userError;
+      if (accountError) throw accountError;
+    } else {
+      // Update user default leverage
+      const { error: userError } = await supabase
+        .from('users')
+        .update({ leverage: Number(leverage) })
+        .eq('id', id);
 
-    // Update all user's accounts
-    const { error: accountError } = await supabase
-      .from('accounts')
-      .update({ leverage })
-      .eq('user_id', id);
+      if (userError) throw userError;
 
-    if (accountError) throw accountError;
+      // Update all user's accounts
+      const { error: accountError } = await supabase
+        .from('accounts')
+        .update({ leverage: Number(leverage) })
+        .eq('user_id', id);
+
+      if (accountError) throw accountError;
+    }
 
     res.json({ success: true, message: 'Leverage updated' });
   } catch (error) {
@@ -203,7 +321,7 @@ exports.updateBrokerageRate = async (req, res) => {
 
     const { error } = await supabase
       .from('users')
-      .update({ brokerage_rate: brokerageRate })
+      .update({ brokerage_rate: Number(brokerageRate) })
       .eq('id', id);
 
     if (error) throw error;
@@ -221,7 +339,7 @@ exports.updateMaxSavedAccounts = async (req, res) => {
 
     const { error } = await supabase
       .from('users')
-      .update({ max_saved_accounts: maxSavedAccounts })
+      .update({ max_saved_accounts: Number(maxSavedAccounts) })
       .eq('id', id);
 
     if (error) throw error;
@@ -253,22 +371,38 @@ exports.toggleClosingMode = async (req, res) => {
 exports.addBalanceToAccount = async (req, res) => {
   try {
     const { id } = req.params; // user id
-    const { amount, accountType = 'live' } = req.body;
+    const { accountId, amount, accountType = 'live', note = 'Admin deposit' } = req.body;
 
     if (!amount || amount <= 0) {
       return res.status(400).json({ success: false, message: 'Invalid amount' });
     }
 
-    // Find the user's account
-    const { data: account, error: findError } = await supabase
-      .from('accounts')
-      .select('*')
-      .eq('user_id', id)
-      .eq('is_demo', accountType === 'demo')
-      .single();
+    let account;
 
-    if (findError || !account) {
-      return res.status(404).json({ success: false, message: 'Account not found' });
+    // Find account by accountId if provided, otherwise by user_id and type
+    if (accountId) {
+      const { data, error } = await supabase
+        .from('accounts')
+        .select('*')
+        .eq('id', accountId)
+        .single();
+
+      if (error || !data) {
+        return res.status(404).json({ success: false, message: 'Account not found' });
+      }
+      account = data;
+    } else {
+      const { data, error } = await supabase
+        .from('accounts')
+        .select('*')
+        .eq('user_id', id)
+        .eq('is_demo', accountType === 'demo')
+        .single();
+
+      if (error || !data) {
+        return res.status(404).json({ success: false, message: 'Account not found' });
+      }
+      account = data;
     }
 
     const newBalance = parseFloat(account.balance || 0) + parseFloat(amount);
@@ -293,12 +427,12 @@ exports.addBalanceToAccount = async (req, res) => {
       type: 'deposit',
       amount: parseFloat(amount),
       status: 'completed',
-      description: 'Admin deposit',
+      description: note || 'Admin deposit',
     });
 
     res.json({
       success: true,
-      message: `₹${amount} added to ${accountType} account`,
+      message: `₹${amount} added to account`,
       newBalance,
     });
   } catch (error) {
@@ -317,22 +451,37 @@ exports.listWithdrawals = async (req, res) => {
       .from('transactions')
       .select(`
         *,
-        users:user_id (email, first_name, last_name),
+        users:user_id (email, first_name, last_name, login_id),
         accounts:account_id (account_number, is_demo)
       `)
       .eq('type', 'withdrawal')
       .order('created_at', { ascending: false });
 
-    if (status) {
+    // Only filter by status if it's a specific status (not 'all' or empty)
+    if (status && status !== 'all') {
       query = query.eq('status', status);
     }
 
     const { data, error } = await query;
 
-    if (error) throw error;
+    if (error) {
+      console.error('listWithdrawals error:', error);
+      throw error;
+    }
 
-    res.json({ success: true, withdrawals: data || [] });
+    // Flatten the joined data for frontend
+    const withdrawals = (data || []).map(w => ({
+      ...w,
+      user_email: w.users?.email || '',
+      user_name: w.users ? `${w.users.first_name || ''} ${w.users.last_name || ''}`.trim() : '',
+      user_login_id: w.users?.login_id || '',
+      account_number: w.accounts?.account_number || '',
+      is_demo: w.accounts?.is_demo || false,
+    }));
+
+    res.json({ success: true, data: withdrawals });
   } catch (error) {
+    console.error('listWithdrawals error:', error);
     res.status(500).json({ success: false, message: error.message });
   }
 };

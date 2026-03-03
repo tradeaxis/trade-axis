@@ -34,7 +34,7 @@ export default function AdminWithdrawals() {
     if (!window.confirm('Approve this withdrawal?')) return;
     
     try {
-      await api.post(`/admin/withdrawals/${id}/approve`, { note: 'Approved by admin' });
+      await api.post(`/admin/withdrawals/${id}/approve`, { adminNote: 'Approved by admin' });
       toast.success('Withdrawal approved');
       loadWithdrawals();
     } catch (e) {
@@ -47,7 +47,7 @@ export default function AdminWithdrawals() {
     const reason = window.prompt('Rejection reason (optional):');
     
     try {
-      await api.post(`/admin/withdrawals/${id}/reject`, { note: reason || 'Rejected by admin' });
+      await api.post(`/admin/withdrawals/${id}/reject`, { adminNote: reason || 'Rejected by admin' });
       toast.success('Withdrawal rejected');
       loadWithdrawals();
     } catch (e) {
@@ -184,11 +184,19 @@ export default function AdminWithdrawals() {
                 <div className="grid grid-cols-2 gap-3 text-xs">
                   <div>
                     <div style={{ color: '#787b86' }}>User</div>
-                    <div style={{ color: '#d1d4dc' }}>{w.user_email || 'User #' + w.user_id?.slice(0, 8)}</div>
+                    <div style={{ color: '#d1d4dc' }}>
+                      {w.user_name || w.user_email || 'User #' + (w.user_id?.slice(0, 8) || '-')}
+                    </div>
+                    {w.user_login_id && (
+                      <div style={{ color: '#787b86' }}>{w.user_login_id}</div>
+                    )}
                   </div>
                   <div>
                     <div style={{ color: '#787b86' }}>Account</div>
-                    <div style={{ color: '#d1d4dc' }}>{w.account_number || 'Account #' + w.account_id?.slice(0, 8)}</div>
+                    <div style={{ color: '#d1d4dc' }}>
+                      {w.account_number || 'Account #' + (w.account_id?.slice(0, 8) || '-')}
+                      {w.is_demo && <span style={{ color: '#f5c542' }}> (Demo)</span>}
+                    </div>
                   </div>
                   <div>
                     <div style={{ color: '#787b86' }}>Method</div>
