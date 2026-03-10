@@ -1,8 +1,27 @@
 // backend/src/services/tradingService.js
+// ✅ Uses kiteStreamService in-memory cache for price lookups
 const { supabase } = require('../config/supabase');
+const kiteStreamService = require('./kiteStreamService');
 
 class TradingService {
-  // Execute market order
+  // ─── Helper: get latest bid/ask ───
+  async getLatestPrice(symbol) {
+    // 1) In-memory cache (instant)
+    const cached = kiteStreamService.getPrice(symbol);
+    if (cached) return { bid: cached.bid, ask: cached.ask };
+
+    // 2) Supabase fallback
+    const { data } = await supabase
+      .from('symbols')
+      .select('bid, ask')
+      .eq('symbol', symbol)
+      .single();
+
+    if (data) return { bid: Number(data.bid), ask: Number(data.ask) };
+    return null;
+  }
+
+  // ─── Execute market order ───
   async executeMarketOrder({
     userId,
     account,
@@ -16,20 +35,22 @@ class TradingService {
     magicNumber = 0,
   }) {
     try {
-      // Get current price
+      // Always use freshest price
+      const live = await this.getLatestPrice(symbolData.symbol);
+      if (live) {
+        symbolData = { ...symbolData, bid: live.bid, ask: live.ask };
+      }
+
       const openPrice = type === 'buy' ? parseFloat(symbolData.ask) : parseFloat(symbolData.bid);
 
       if (!openPrice || openPrice <= 0) {
         return { success: false, message: 'Invalid price. Market may be closed.' };
       }
 
-      // Calculate margin required
       const lotSize = symbolData.lot_size || 1;
-      const marginRate = symbolData.margin_rate || 10; // percentage
       const leverage = account.leverage || 5;
       const marginRequired = (openPrice * quantity * lotSize) / leverage;
 
-      // Check free margin
       const freeMargin = parseFloat(account.free_margin || account.balance);
       if (marginRequired > freeMargin) {
         return {
@@ -38,11 +59,9 @@ class TradingService {
         };
       }
 
-      // Calculate brokerage
-      const brokerageRate = 0.0003; // 0.03%
+      const brokerageRate = 0.0003;
       const brokerage = openPrice * quantity * lotSize * brokerageRate;
 
-      // Create trade
       const tradeData = {
         user_id: userId,
         account_id: account.id,
@@ -63,25 +82,20 @@ class TradingService {
         open_time: new Date().toISOString(),
       };
 
-      const { data: trade, error: tradeError } = await supabase
+      const { data: trade, error } = await supabase
         .from('trades')
         .insert(tradeData)
         .select()
         .single();
 
-      if (tradeError) throw tradeError;
+      if (error) throw error;
 
-      // Update account margin
       const newMargin = parseFloat(account.margin || 0) + marginRequired;
       const newFreeMargin = parseFloat(account.balance) - newMargin;
 
       await supabase
         .from('accounts')
-        .update({
-          margin: newMargin,
-          free_margin: newFreeMargin,
-          updated_at: new Date().toISOString(),
-        })
+        .update({ margin: newMargin, free_margin: newFreeMargin, updated_at: new Date().toISOString() })
         .eq('id', account.id);
 
       return {
@@ -90,12 +104,12 @@ class TradingService {
         message: `${type.toUpperCase()} ${quantity} ${symbolData.symbol} @ ${openPrice}`,
       };
     } catch (error) {
-      console.error('Execute market order error:', error);
+      console.error('executeMarketOrder error:', error);
       return { success: false, message: 'Failed to execute order' };
     }
   }
 
-  // Create pending order
+  // ─── Create pending order ───
   async createPendingOrder({
     userId,
     account,
@@ -116,127 +130,97 @@ class TradingService {
         return { success: false, message: 'Invalid price for pending order' };
       }
 
+      const live = await this.getLatestPrice(symbolData.symbol);
+      if (live) symbolData = { ...symbolData, bid: live.bid, ask: live.ask };
+
       const currentPrice = type === 'buy' ? parseFloat(symbolData.ask) : parseFloat(symbolData.bid);
 
-      // Validate price based on order type
-      const validationResult = this.validatePendingOrderPrice(orderType, type, price, currentPrice);
-      if (!validationResult.valid) {
-        return { success: false, message: validationResult.message };
-      }
+      const validation = this.validatePendingOrderPrice(orderType, type, price, currentPrice);
+      if (!validation.valid) return { success: false, message: validation.message };
 
-      // Calculate margin required (reserved for pending orders)
       const lotSize = symbolData.lot_size || 1;
       const leverage = account.leverage || 5;
       const marginRequired = (price * quantity * lotSize) / leverage;
 
-      // Check free margin
       const freeMargin = parseFloat(account.free_margin || account.balance);
       if (marginRequired > freeMargin) {
         return {
           success: false,
-          message: `Insufficient margin for pending order. Required: ₹${marginRequired.toFixed(2)}`,
+          message: `Insufficient margin. Required: ₹${marginRequired.toFixed(2)}`,
         };
       }
 
-      // Create pending order
-      const orderData = {
-        user_id: userId,
-        account_id: account.id,
-        symbol: symbolData.symbol,
-        order_type: orderType,
-        trade_type: type,
-        quantity,
-        price,
-        stop_loss: stopLoss,
-        take_profit: takeProfit,
-        margin_reserved: marginRequired,
-        status: 'pending',
-        comment,
-        expiration,
-        expiration_time: expirationTime,
-        magic_number: magicNumber,
-        created_at: new Date().toISOString(),
-      };
-
-      const { data: order, error: orderError } = await supabase
+      const { data: order, error } = await supabase
         .from('pending_orders')
-        .insert(orderData)
+        .insert({
+          user_id: userId,
+          account_id: account.id,
+          symbol: symbolData.symbol,
+          order_type: orderType,
+          trade_type: type,
+          quantity,
+          price,
+          stop_loss: stopLoss,
+          take_profit: takeProfit,
+          margin_reserved: marginRequired,
+          status: 'pending',
+          comment,
+          expiration,
+          expiration_time: expirationTime,
+          magic_number: magicNumber,
+          created_at: new Date().toISOString(),
+        })
         .select()
         .single();
 
-      if (orderError) throw orderError;
+      if (error) throw error;
 
-      return {
-        success: true,
-        order,
-        message: `Pending ${orderType.toUpperCase()} order created at ${price}`,
-      };
+      return { success: true, order, message: `Pending ${orderType.toUpperCase()} at ${price}` };
     } catch (error) {
-      console.error('Create pending order error:', error);
+      console.error('createPendingOrder error:', error);
       return { success: false, message: 'Failed to create pending order' };
     }
   }
 
-  // Validate pending order price
   validatePendingOrderPrice(orderType, type, price, currentPrice) {
     switch (orderType) {
       case 'buy_limit':
-        if (price >= currentPrice) {
-          return { valid: false, message: 'Buy Limit price must be below current price' };
-        }
+        if (price >= currentPrice) return { valid: false, message: 'Buy Limit must be below current price' };
         break;
       case 'sell_limit':
-        if (price <= currentPrice) {
-          return { valid: false, message: 'Sell Limit price must be above current price' };
-        }
+        if (price <= currentPrice) return { valid: false, message: 'Sell Limit must be above current price' };
         break;
       case 'buy_stop':
-        if (price <= currentPrice) {
-          return { valid: false, message: 'Buy Stop price must be above current price' };
-        }
+        if (price <= currentPrice) return { valid: false, message: 'Buy Stop must be above current price' };
         break;
       case 'sell_stop':
-        if (price >= currentPrice) {
-          return { valid: false, message: 'Sell Stop price must be below current price' };
-        }
+        if (price >= currentPrice) return { valid: false, message: 'Sell Stop must be below current price' };
         break;
     }
     return { valid: true };
   }
 
-  // Close position
+  // ─── Close position ───
   async closePosition(trade) {
     try {
-      // Get current price
-      const { data: symbolData, error: symbolError } = await supabase
-        .from('symbols')
-        .select('bid, ask, lot_size')
-        .eq('symbol', trade.symbol)
-        .single();
+      const price = await this.getLatestPrice(trade.symbol);
+      if (!price) return { success: false, message: 'Failed to get current price' };
 
-      if (symbolError || !symbolData) {
-        return { success: false, message: 'Failed to get current price' };
-      }
+      const closePrice =
+        trade.trade_type === 'buy' ? parseFloat(price.bid) : parseFloat(price.ask);
 
-      // Close price is bid for buy, ask for sell
-      const closePrice = trade.trade_type === 'buy' 
-        ? parseFloat(symbolData.bid) 
-        : parseFloat(symbolData.ask);
+      const dir = trade.trade_type === 'buy' ? 1 : -1;
+      const lotSize = trade.lot_size || 1;
+      const gross = (closePrice - parseFloat(trade.open_price)) * dir * trade.quantity * lotSize;
+      const net = gross - parseFloat(trade.brokerage || 0);
 
-      // Calculate P&L
-      const direction = trade.trade_type === 'buy' ? 1 : -1;
-      const priceDiff = (closePrice - parseFloat(trade.open_price)) * direction;
-      const lotSize = trade.lot_size || symbolData.lot_size || 1;
-      const grossProfit = priceDiff * trade.quantity * lotSize;
-      const netProfit = grossProfit - parseFloat(trade.brokerage || 0);
-
-      // Update trade
       const closeTime = new Date().toISOString();
-      const { data: closedTrade, error: updateError } = await supabase
+
+      const { data: closedTrade, error } = await supabase
         .from('trades')
         .update({
           close_price: closePrice,
-          profit: netProfit,
+          profit: net,
           status: 'closed',
           close_time: closeTime,
           updated_at: closeTime,
@@ -245,9 +229,9 @@ class TradingService {
         .select()
         .single();
 
-      if (updateError) throw updateError;
+      if (error) throw error;
 
-      // Update account balance and margin
+      // Update account
       const { data: account } = await supabase
         .from('accounts')
         .select('*')
@@ -255,68 +239,50 @@ class TradingService {
         .single();
 
       if (account) {
-        const newBalance = parseFloat(account.balance) + netProfit;
+        const newBalance = parseFloat(account.balance) + net;
         const newMargin = Math.max(0, parseFloat(account.margin) - parseFloat(trade.margin || 0));
-        const newFreeMargin = newBalance - newMargin;
 
         await supabase
           .from('accounts')
           .update({
             balance: newBalance,
             margin: newMargin,
-            free_margin: newFreeMargin,
+            free_margin: newBalance - newMargin,
             updated_at: closeTime,
           })
           .eq('id', account.id);
       }
 
-      return {
-        success: true,
-        trade: closedTrade,
-        message: `Position closed at ${closePrice}. P&L: ${netProfit.toFixed(2)}`,
-      };
+      return { success: true, trade: closedTrade, message: `Closed @ ${closePrice}. P&L: ${net.toFixed(2)}` };
     } catch (error) {
-      console.error('Close position error:', error);
+      console.error('closePosition error:', error);
       return { success: false, message: 'Failed to close position' };
     }
   }
 
-  // Partial close position
+  // ─── Partial close ───
   async partialClosePosition(trade, closeVolume) {
     try {
-      // Get current price
-      const { data: symbolData, error: symbolError } = await supabase
-        .from('symbols')
-        .select('bid, ask, lot_size')
-        .eq('symbol', trade.symbol)
-        .single();
+      const price = await this.getLatestPrice(trade.symbol);
+      if (!price) return { success: false, message: 'Failed to get current price' };
 
-      if (symbolError || !symbolData) {
-        return { success: false, message: 'Failed to get current price' };
-      }
+      const closePrice =
+        trade.trade_type === 'buy' ? parseFloat(price.bid) : parseFloat(price.ask);
 
-      const closePrice = trade.trade_type === 'buy' 
-        ? parseFloat(symbolData.bid) 
-        : parseFloat(symbolData.ask);
+      const totalVol = parseFloat(trade.quantity);
+      const remaining = totalVol - closeVolume;
 
-      const totalVolume = parseFloat(trade.quantity);
-      const remainingVolume = totalVolume - closeVolume;
+      const dir = trade.trade_type === 'buy' ? 1 : -1;
+      const lotSize = trade.lot_size || 1;
+      const closedProfit = (closePrice - parseFloat(trade.open_price)) * dir * closeVolume * lotSize;
 
-      // Calculate P&L for closed portion
-      const direction = trade.trade_type === 'buy' ? 1 : -1;
-      const priceDiff = (closePrice - parseFloat(trade.open_price)) * direction;
-      const lotSize = trade.lot_size || symbolData.lot_size || 1;
-      const closedProfit = priceDiff * closeVolume * lotSize;
-
-      // Proportional brokerage and margin
-      const closedBrokerage = (parseFloat(trade.brokerage || 0) / totalVolume) * closeVolume;
-      const closedMargin = (parseFloat(trade.margin || 0) / totalVolume) * closeVolume;
-      const netClosedProfit = closedProfit - closedBrokerage;
+      const closedBrokerage = (parseFloat(trade.brokerage || 0) / totalVol) * closeVolume;
+      const closedMargin = (parseFloat(trade.margin || 0) / totalVol) * closeVolume;
+      const netClosed = closedProfit - closedBrokerage;
 
       const closeTime = new Date().toISOString();
 
-      // Create closed trade record
-      const { data: closedTrade, error: closedError } = await supabase
+      const { data: closedTrade, error: e1 } = await supabase
         .from('trades')
         .insert({
           user_id: trade.user_id,
@@ -331,7 +297,7 @@ class TradingService {
           take_profit: 0,
           margin: closedMargin,
           brokerage: closedBrokerage,
-          profit: netClosedProfit,
+          profit: netClosed,
           status: 'closed',
           comment: `Partial close of #${trade.id}`,
           magic_number: trade.magic_number,
@@ -341,27 +307,20 @@ class TradingService {
         .select()
         .single();
 
-      if (closedError) throw closedError;
+      if (e1) throw e1;
 
-      // Update original trade with remaining volume
-      const remainingBrokerage = parseFloat(trade.brokerage || 0) - closedBrokerage;
-      const remainingMargin = parseFloat(trade.margin || 0) - closedMargin;
+      const remainBrokerage = parseFloat(trade.brokerage || 0) - closedBrokerage;
+      const remainMargin = parseFloat(trade.margin || 0) - closedMargin;
 
-      const { data: remainingTrade, error: updateError } = await supabase
+      const { data: remainingTrade, error: e2 } = await supabase
         .from('trades')
-        .update({
-          quantity: remainingVolume,
-          margin: remainingMargin,
-          brokerage: remainingBrokerage,
-          updated_at: closeTime,
-        })
+        .update({ quantity: remaining, margin: remainMargin, brokerage: remainBrokerage, updated_at: closeTime })
         .eq('id', trade.id)
         .select()
         .single();
 
-      if (updateError) throw updateError;
+      if (e2) throw e2;
 
-      // Update account
       const { data: account } = await supabase
         .from('accounts')
         .select('*')
@@ -369,18 +328,11 @@ class TradingService {
         .single();
 
       if (account) {
-        const newBalance = parseFloat(account.balance) + netClosedProfit;
-        const newMargin = Math.max(0, parseFloat(account.margin) - closedMargin);
-        const newFreeMargin = newBalance - newMargin;
-
+        const newBal = parseFloat(account.balance) + netClosed;
+        const newMar = Math.max(0, parseFloat(account.margin) - closedMargin);
         await supabase
           .from('accounts')
-          .update({
-            balance: newBalance,
-            margin: newMargin,
-            free_margin: newFreeMargin,
-            updated_at: closeTime,
-          })
+          .update({ balance: newBal, margin: newMar, free_margin: newBal - newMar, updated_at: closeTime })
           .eq('id', account.id);
       }
 
@@ -388,18 +340,17 @@ class TradingService {
         success: true,
         closedTrade,
         remainingTrade,
-        message: `Closed ${closeVolume} lots at ${closePrice}. Remaining: ${remainingVolume} lots`,
+        message: `Closed ${closeVolume} lots @ ${closePrice}. Remaining: ${remaining}`,
       };
     } catch (error) {
-      console.error('Partial close error:', error);
-      return { success: false, message: 'Failed to partial close position' };
+      console.error('partialClose error:', error);
+      return { success: false, message: 'Failed to partial close' };
     }
   }
 
-  // Check and trigger pending orders (called by background job)
+  // ─── Check pending orders (background) ───
   async checkPendingOrders() {
     try {
-      // Get all pending orders
       const { data: orders, error } = await supabase
         .from('pending_orders')
         .select('*, accounts(*)')
@@ -408,100 +359,78 @@ class TradingService {
       if (error || !orders || orders.length === 0) return;
 
       for (const order of orders) {
-        // Get current price
-        const { data: symbolData } = await supabase
-          .from('symbols')
-          .select('*')
-          .eq('symbol', order.symbol)
-          .single();
+        const price = await this.getLatestPrice(order.symbol);
+        if (!price) continue;
 
-        if (!symbolData) continue;
-
-        const currentBid = parseFloat(symbolData.bid);
-        const currentAsk = parseFloat(symbolData.ask);
+        const currentBid = parseFloat(price.bid);
+        const currentAsk = parseFloat(price.ask);
         const orderPrice = parseFloat(order.price);
 
         let shouldTrigger = false;
 
         switch (order.order_type) {
-          case 'buy_limit':
-            shouldTrigger = currentAsk <= orderPrice;
-            break;
-          case 'sell_limit':
-            shouldTrigger = currentBid >= orderPrice;
-            break;
-          case 'buy_stop':
-            shouldTrigger = currentAsk >= orderPrice;
-            break;
-          case 'sell_stop':
-            shouldTrigger = currentBid <= orderPrice;
-            break;
+          case 'buy_limit':  shouldTrigger = currentAsk <= orderPrice; break;
+          case 'sell_limit': shouldTrigger = currentBid >= orderPrice; break;
+          case 'buy_stop':   shouldTrigger = currentAsk >= orderPrice; break;
+          case 'sell_stop':  shouldTrigger = currentBid <= orderPrice; break;
         }
 
         if (shouldTrigger) {
-          // Execute the order
+          const { data: symData } = await supabase
+            .from('symbols')
+            .select('*')
+            .eq('symbol', order.symbol)
+            .single();
+
+          if (!symData) continue;
+
           const result = await this.executeMarketOrder({
             userId: order.user_id,
             account: order.accounts,
-            symbolData,
+            symbolData: symData,
             type: order.trade_type,
             quantity: order.quantity,
             stopLoss: order.stop_loss,
             takeProfit: order.take_profit,
-            comment: `Triggered from pending order #${order.id}`,
+            comment: `Triggered from pending #${order.id}`,
             magicNumber: order.magic_number,
           });
 
           if (result.success) {
-            // Update pending order status
             await supabase
               .from('pending_orders')
-              .update({
-                status: 'triggered',
-                triggered_at: new Date().toISOString(),
-                trade_id: result.trade.id,
-              })
+              .update({ status: 'triggered', triggered_at: new Date().toISOString(), trade_id: result.trade.id })
               .eq('id', order.id);
 
-            console.log(`✅ Pending order #${order.id} triggered`);
+            console.log(`✅ Pending #${order.id} triggered`);
           }
         }
 
-        // Check expiration
+        // Expiration check
         if (order.expiration === 'today') {
-          const orderDate = new Date(order.created_at).toDateString();
-          const today = new Date().toDateString();
-
-          if (orderDate !== today) {
+          if (new Date(order.created_at).toDateString() !== new Date().toDateString()) {
             await supabase
               .from('pending_orders')
-              .update({
-                status: 'expired',
-                expired_at: new Date().toISOString(),
-              })
+              .update({ status: 'expired', expired_at: new Date().toISOString() })
               .eq('id', order.id);
           }
         } else if (order.expiration === 'specified' && order.expiration_time) {
           if (new Date() > new Date(order.expiration_time)) {
             await supabase
               .from('pending_orders')
-              .update({
-                status: 'expired',
-                expired_at: new Date().toISOString(),
-              })
+              .update({ status: 'expired', expired_at: new Date().toISOString() })
               .eq('id', order.id);
           }
         }
       }
     } catch (error) {
-      console.error('Check pending orders error:', error);
+      console.error('checkPendingOrders error:', error);
     }
   }
 
-  // Check and trigger SL/TP (called by background job)
+  // ─── Check SL / TP (background) ───
   async checkStopLossAndTakeProfit() {
     try {
-      // Get all open trades with SL or TP
       const { data: trades, error } = await supabase
         .from('trades')
         .select('*')
@@ -511,59 +440,35 @@ class TradingService {
       if (error || !trades || trades.length === 0) return;
 
       for (const trade of trades) {
-        // Get current price
-        const { data: symbolData } = await supabase
-          .from('symbols')
-          .select('bid, ask')
-          .eq('symbol', trade.symbol)
-          .single();
+        const price = await this.getLatestPrice(trade.symbol);
+        if (!price) continue;
 
-        if (!symbolData) continue;
+        const currentPrice =
+          trade.trade_type === 'buy' ? parseFloat(price.bid) : parseFloat(price.ask);
 
-        const currentPrice = trade.trade_type === 'buy' 
-          ? parseFloat(symbolData.bid) 
-          : parseFloat(symbolData.ask);
-
-        const stopLoss = parseFloat(trade.stop_loss);
-        const takeProfit = parseFloat(trade.take_profit);
+        const sl = parseFloat(trade.stop_loss);
+        const tp = parseFloat(trade.take_profit);
 
         let shouldClose = false;
-        let closeReason = '';
+        let reason = '';
 
-        // Check Stop Loss
-        if (stopLoss > 0) {
-          if (trade.trade_type === 'buy' && currentPrice <= stopLoss) {
-            shouldClose = true;
-            closeReason = 'Stop Loss triggered';
-          } else if (trade.trade_type === 'sell' && currentPrice >= stopLoss) {
-            shouldClose = true;
-            closeReason = 'Stop Loss triggered';
-          }
+        if (sl > 0) {
+          if (trade.trade_type === 'buy' && currentPrice <= sl) { shouldClose = true; reason = 'Stop Loss'; }
+          if (trade.trade_type === 'sell' && currentPrice >= sl) { shouldClose = true; reason = 'Stop Loss'; }
         }
 
-        // Check Take Profit
-        if (!shouldClose && takeProfit > 0) {
-          if (trade.trade_type === 'buy' && currentPrice >= takeProfit) {
-            shouldClose = true;
-            closeReason = 'Take Profit triggered';
-          } else if (trade.trade_type === 'sell' && currentPrice <= takeProfit) {
-            shouldClose = true;
-            closeReason = 'Take Profit triggered';
-          }
+        if (!shouldClose && tp > 0) {
+          if (trade.trade_type === 'buy' && currentPrice >= tp) { shouldClose = true; reason = 'Take Profit'; }
+          if (trade.trade_type === 'sell' && currentPrice <= tp) { shouldClose = true; reason = 'Take Profit'; }
         }
 
         if (shouldClose) {
           const result = await this.closePosition(trade);
-          if (result.success) {
-            console.log(`✅ ${closeReason} for trade #${trade.id}`);
-
-            // Notify user via WebSocket (if available)
-            // This would be done through the socketHandler
-          }
+          if (result.success) console.log(`✅ ${reason} triggered for trade #${trade.id}`);
         }
       }
     } catch (error) {
-      console.error('Check SL/TP error:', error);
+      console.error('checkSL/TP error:', error);
     }
   }
 }

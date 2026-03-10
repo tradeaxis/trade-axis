@@ -10,10 +10,33 @@ class KiteStreamService {
     this.running = false;
     this.tokenToSymbols = new Map(); // token -> [symbolRows]
     this.lastTickAt = null;
+
+    // ✅ NEW: In-memory price cache for instant access (no DB round-trip)
+    this.latestPrices = new Map(); // symbol -> { bid, ask, last, change, changePercent, timestamp }
+
+    // ✅ NEW: DB write buffer — emit to WebSocket instantly, write to DB in batches
+    this.priceBuffer = new Map(); // token -> { symbols, payload }
+    this.dbFlushInterval = null;
+    this.isFlushing = false;
+    this.DB_FLUSH_MS = 3000; // Flush to DB every 3 seconds
   }
 
   isRunning() {
     return this.running;
+  }
+
+  // ✅ NEW: Get latest real-time price from memory (sub-millisecond, no DB)
+  getLatestPrice(symbol) {
+    return this.latestPrices.get(String(symbol).toUpperCase()) || null;
+  }
+
+  // ✅ NEW: Get all latest prices
+  getAllLatestPrices() {
+    const result = {};
+    for (const [sym, data] of this.latestPrices) {
+      result[sym] = data;
+    }
+    return result;
   }
 
   async buildTokenMap() {
@@ -60,7 +83,7 @@ class KiteStreamService {
     this.ticker = new KiteTicker({ api_key: apiKey, access_token: accessToken });
     this.running = true;
 
-    const mode = String(process.env.KITE_TICK_MODE || 'full').toLowerCase(); // full | quote | ltp
+    const mode = String(process.env.KITE_TICK_MODE || 'full').toLowerCase();
 
     this.ticker.on('connect', () => {
       console.log('✅ KiteTicker connected. Subscribing tokens:', tokens.length);
@@ -68,9 +91,9 @@ class KiteStreamService {
       this.ticker.setMode(mode, tokens);
     });
 
-    this.ticker.on('ticks', async (ticks) => {
+    this.ticker.on('ticks', (ticks) => {
       this.lastTickAt = new Date().toISOString();
-      await this.handleTicks(ticks);
+      this.handleTicks(ticks); // ✅ NOT awaited — fire and forget for speed
     });
 
     this.ticker.on('error', (err) => {
@@ -82,13 +105,27 @@ class KiteStreamService {
       this.running = false;
     });
 
+    this.ticker.on('reconnect', () => {
+      console.log('🔄 KiteTicker reconnecting...');
+    });
+
     this.ticker.connect();
+
+    // ✅ Start periodic DB flusher
+    this.startDbFlusher();
 
     return { started: true, tokens: tokens.length, mode };
   }
 
   async stop() {
     try {
+      if (this.dbFlushInterval) {
+        clearInterval(this.dbFlushInterval);
+        this.dbFlushInterval = null;
+      }
+      // Final flush before stopping
+      await this.flushPriceBuffer();
+
       if (this.ticker) {
         this.ticker.disconnect();
         this.ticker = null;
@@ -99,16 +136,54 @@ class KiteStreamService {
     return { stopped: true };
   }
 
-  async handleTicks(ticks) {
+  // ✅ NEW: Start periodic DB flush
+  startDbFlusher() {
+    if (this.dbFlushInterval) clearInterval(this.dbFlushInterval);
+    this.dbFlushInterval = setInterval(() => this.flushPriceBuffer(), this.DB_FLUSH_MS);
+    console.log(`📦 DB price flusher started (every ${this.DB_FLUSH_MS}ms)`);
+  }
+
+  // ✅ NEW: Flush buffered prices to DB in batches
+  async flushPriceBuffer() {
+    if (this.isFlushing || this.priceBuffer.size === 0) return;
+    this.isFlushing = true;
+
+    try {
+      const entries = [...this.priceBuffer.values()];
+      this.priceBuffer.clear();
+
+      // Parallel batch updates — each entry updates 1-3 symbols sharing same token
+      const BATCH = 200;
+      for (let i = 0; i < entries.length; i += BATCH) {
+        const batch = entries.slice(i, i + BATCH);
+        await Promise.allSettled(
+          batch.map(({ symbols, payload }) =>
+            supabase.from('symbols').update(payload).in('symbol', symbols)
+          )
+        );
+      }
+    } catch (e) {
+      console.error('DB flush error:', e.message);
+    } finally {
+      this.isFlushing = false;
+    }
+  }
+
+  // ✅ OPTIMIZED: Emit to WebSocket INSTANTLY, buffer DB writes
+  handleTicks(ticks) {
     if (!ticks || ticks.length === 0) return;
 
-    // Batch DB updates (but per-symbol upsert is fine here because count is limited by subscriptions)
+    const now = Date.now();
+    const isoNow = new Date().toISOString();
+
     for (const t of ticks) {
       const token = Number(t.instrument_token);
       const symbols = this.tokenToSymbols.get(token);
       if (!symbols || symbols.length === 0) continue;
 
       const last = Number(t.last_price || 0);
+      if (last <= 0) continue; // Skip invalid prices
+
       const ohlc = t.ohlc || {};
       const prevClose = Number(ohlc.close || 0);
       const chgVal = prevClose ? (last - prevClose) : 0;
@@ -118,10 +193,14 @@ class KiteStreamService {
       let ask = last;
 
       // FULL mode provides depth
-      if (t.depth?.buy?.length) bid = Number(t.depth.buy[0].price || last);
-      if (t.depth?.sell?.length) ask = Number(t.depth.sell[0].price || last);
+      if (t.depth?.buy?.length && t.depth.buy[0].price > 0) {
+        bid = Number(t.depth.buy[0].price);
+      }
+      if (t.depth?.sell?.length && t.depth.sell[0].price > 0) {
+        ask = Number(t.depth.sell[0].price);
+      }
 
-      const updatePayload = {
+      const dbPayload = {
         last_price: last,
         bid,
         ask,
@@ -129,32 +208,41 @@ class KiteStreamService {
         high_price: Number(ohlc.high || last),
         low_price: Number(ohlc.low || last),
         previous_close: prevClose || last,
-        change_value: chgVal,
-        change_percent: chgPct,
-        last_update: new Date().toISOString(),
+        change_value: parseFloat(chgVal.toFixed(2)),
+        change_percent: parseFloat(chgPct.toFixed(2)),
+        last_update: isoNow,
       };
 
-      // Update ALL app symbols that map to this token (actual + aliases I/II/III)
-      const { error } = await supabase
-        .from('symbols')
-        .update(updatePayload)
-        .in('symbol', symbols);
-
-      if (error) {
-        console.error('symbols update error:', error.message);
-        continue;
+      // ✅ STEP 1: Update in-memory cache (instant)
+      for (const s of symbols) {
+        this.latestPrices.set(s, {
+          bid,
+          ask,
+          last,
+          open: dbPayload.open_price,
+          high: dbPayload.high_price,
+          low: dbPayload.low_price,
+          previousClose: prevClose,
+          change: chgVal,
+          changePercent: chgPct,
+          timestamp: now,
+          source: 'kite',
+        });
       }
 
-      // Emit to each symbol room
+      // ✅ STEP 2: Buffer for DB write (async, not blocking)
+      this.priceBuffer.set(token, { symbols: [...symbols], payload: dbPayload });
+
+      // ✅ STEP 3: Emit to WebSocket rooms IMMEDIATELY (no DB wait)
       for (const s of symbols) {
         this.io?.to(`symbol:${s}`).emit('price:update', {
           symbol: s,
           bid,
           ask,
           last,
-          change: chgVal,
-          changePercent: chgPct,
-          timestamp: Date.now(),
+          change: parseFloat(chgVal.toFixed(2)),
+          changePercent: parseFloat(chgPct.toFixed(2)),
+          timestamp: now,
           source: 'kite',
         });
       }
@@ -166,6 +254,8 @@ class KiteStreamService {
       running: this.running,
       lastTickAt: this.lastTickAt,
       tokenCount: this.tokenToSymbols?.size || 0,
+      pricesCached: this.latestPrices.size,
+      bufferSize: this.priceBuffer.size,
     };
   }
 }

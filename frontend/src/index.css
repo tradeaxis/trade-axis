@@ -45,8 +45,8 @@ body {
   font-family: Segoe UI, Tahoma, Arial, sans-serif;
   background: var(--mt5-bg);
   color: var(--mt5-text);
-  font-size: 14px;
-  line-height: 1.5;
+  font-size: 16px;              /* ✅ INCREASED from 14px */
+  line-height: 1.55;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
@@ -55,10 +55,10 @@ h1, h2, h3, h4, h5, h6 {
   font-weight: 600;
 }
 
-h1 { font-size: 2rem; }
-h2 { font-size: 1.75rem; }
-h3 { font-size: 1.5rem; }
-h4 { font-size: 1.25rem; }
+h1 { font-size: 2.25rem; }      /* ✅ INCREASED from 2rem */
+h2 { font-size: 1.875rem; }     /* ✅ INCREASED from 1.75rem */
+h3 { font-size: 1.625rem; }     /* ✅ INCREASED from 1.5rem */
+h4 { font-size: 1.375rem; }     /* ✅ INCREASED from 1.25rem */
 
 ::-webkit-scrollbar {
   width: 8px;
@@ -91,17 +91,47 @@ h4 { font-size: 1.25rem; }
 .bg-green-500\/20 { background-color: rgba(0, 200, 83, 0.18); }
 .bg-red-500\/20 { background-color: rgba(255, 82, 82, 0.18); }
 
+/* ✅ INCREASED: Global input/button font sizes */
 input, select, textarea, button {
-  font-size: 14px;
+  font-size: 16px;              /* ✅ INCREASED from 14px */
 }
 
+/* ✅ MOBILE: Even larger text for touch screens */
 @media (max-width: 768px) {
-  input, select, textarea {
-    font-size: 16px !important;
-  }
-  
   body {
-    font-size: 14px;
+    font-size: 16px;            /* ✅ INCREASED from 14px */
+  }
+
+  input, select, textarea {
+    font-size: 18px !important; /* ✅ INCREASED from 16px — prevents iOS zoom on focus */
+    padding: 10px 12px !important;
+  }
+
+  button {
+    font-size: 16px !important;
+    min-height: 44px;           /* ✅ Apple's minimum touch target */
+  }
+
+  h1 { font-size: 1.75rem; }
+  h2 { font-size: 1.5rem; }
+  h3 { font-size: 1.25rem; }
+  h4 { font-size: 1.125rem; }
+
+  /* ✅ Make table/list text readable on phone */
+  .text-xs { font-size: 0.8125rem !important; }   /* 13px instead of 12px */
+  .text-sm { font-size: 0.9375rem !important; }   /* 15px instead of 14px */
+
+  /* ✅ Larger row padding for touch */
+  .market-row {
+    padding: 12px 14px !important;
+    min-height: 52px;
+  }
+}
+
+/* ✅ TABLET */
+@media (min-width: 769px) and (max-width: 1024px) {
+  body {
+    font-size: 16px;
   }
 }
 

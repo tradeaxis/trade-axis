@@ -36,6 +36,7 @@ const SocketHandler = require('./websocket/socketHandler');
 
 const kiteService = require('./services/kiteService');
 const kiteStreamService = require('./services/kiteStreamService');
+const tradingService = require('./services/tradingService');
 const weeklySettlementService = require('./services/weeklySettlementService');
 
 const app = express();
@@ -43,17 +44,7 @@ const server = http.createServer(app);
 
 const isDev = process.env.NODE_ENV === 'development';
 
-// ✅ CORS Configuration — allow ALL origins for now
-const ALLOWED_ORIGINS = [
-  'http://localhost:5173',
-  'http://localhost:3000',
-  'http://localhost:5000',
-  'capacitor://localhost',
-  'http://localhost',
-  'https://tradeaxis-cf3.pages.dev',
-  process.env.FRONTEND_URL,
-].filter(Boolean);
-
+// ✅ CORS Configuration
 const corsOptions = {
   origin: true,
   credentials: true,
@@ -61,7 +52,7 @@ const corsOptions = {
   allowedHeaders: ['Content-Type', 'Authorization'],
 };
 
-// ✅ Socket.IO with open CORS
+// ✅ Socket.IO
 const io = new Server(server, {
   cors: {
     origin: true,
@@ -108,7 +99,7 @@ app.get('/health', async (req, res) => {
   });
 });
 
-// ✅ Version check (for APK auto-update)
+// ✅ Version check
 app.get('/api/version', (req, res) => {
   res.json({ version: '1.0.0', minVersion: '1.0.0' });
 });
@@ -151,6 +142,7 @@ const startServer = async () => {
     console.log('');
     console.log('🚀 ══════════════════════════════════════════════════════════');
     console.log('   TRADE AXIS SERVER (HTTP + WebSocket)');
+    console.log('   ⛔ Simulation: DISABLED — Kite API data only');
     console.log('══════════════════════════════════════════════════════════════');
     console.log(`   📍 HTTP: http://localhost:${PORT}`);
     console.log(`   ⚡ WS : ws://localhost:${PORT}`);
@@ -169,7 +161,17 @@ const startServer = async () => {
 
     console.log(`⏰ Weekly settlement scheduled: "${cronExpr}" (${tz})`);
 
-    // ✅ Kite auto-start (if token exists in DB)
+    // ✅ Pending order check every 5 seconds
+    setInterval(async () => {
+      try {
+        await tradingService.checkPendingOrders();
+      } catch (e) {
+        // silent — errors logged inside the method
+      }
+    }, 5000);
+    console.log('📋 Pending order checks started (5s interval)');
+
+    // ✅ Kite auto-start
     if (String(process.env.KITE_AUTO_START || 'true') === 'true') {
       try {
         await kiteService.init();
@@ -178,6 +180,7 @@ const startServer = async () => {
           console.log('✅ Kite stream auto-start result:', result);
         } else {
           console.log('ℹ️ Kite session not ready. Admin must create session daily.');
+          console.log('   Prices will show last known values from DB (no simulation).');
         }
       } catch (e) {
         console.log('ℹ️ Kite stream not started:', e.message);
